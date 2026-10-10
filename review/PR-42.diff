@@ -1,0 +1,169 @@
+diff --git a/src/http/routes/events.ts b/src/http/routes/events.ts
+index b280960..7e9b4f1 100644
+--- a/src/http/routes/events.ts
++++ b/src/http/routes/events.ts
+@@ -29,7 +29,7 @@ const UpdateEventBody = z
+     venue: z.string().trim().min(1).max(200),
+     startsAt: localDateTime,
+     durationMinutes: z.number().int().min(15).max(24 * 60),
+-    capacity: z.number().int().min(1).max(10_000),
++    capacity: z.number().int().max(10_000),
+   })
+   .partial();
+ 
+diff --git a/src/http/routes/rsvps.ts b/src/http/routes/rsvps.ts
+index 9687579..43c7b88 100644
+--- a/src/http/routes/rsvps.ts
++++ b/src/http/routes/rsvps.ts
+@@ -14,6 +14,7 @@ export function rsvpRoutes(services: Services): Router {
+   const limit = rateLimit({ max, windowMs, clock: services.clock });
+   const auth = requireUser(services.auth);
+   const JoinBody = z.object({ guests: z.number().int().min(0).max(services.config.maxGuests).default(0) });
++  const UpdateBody = z.object({ guests: z.number().int().min(0).max(services.config.maxGuests) });
+ 
+   router.post('/events/:id/rsvps', limit, auth, (req, res) => {
+     const { id } = Params.parse(req.params);
+@@ -22,6 +23,13 @@ export function rsvpRoutes(services: Services): Router {
+     res.status(201).json({ rsvp: rsvpDto(rsvp) });
+   });
+ 
++  router.patch('/events/:id/rsvps/:rsvpId', limit, auth, (req, res) => {
++    const { id, rsvpId } = RsvpParams.parse(req.params);
++    const { guests } = UpdateBody.parse(req.body);
++    const rsvp = services.rsvps.updateGuests(currentUser(res), id, rsvpId, guests);
++    res.json({ rsvp: rsvpDto(rsvp) });
++  });
++
+   router.delete('/events/:id/rsvps/:rsvpId', limit, auth, (req, res) => {
+     const { id, rsvpId } = RsvpParams.parse(req.params);
+     const rsvp = services.rsvps.cancel(currentUser(res), id, rsvpId);
+diff --git a/src/services/rsvpService.ts b/src/services/rsvpService.ts
+index 0523ad8..842ec22 100644
+--- a/src/services/rsvpService.ts
++++ b/src/services/rsvpService.ts
+@@ -63,6 +63,31 @@ export class RsvpService {
+     return cancelled;
+   }
+ 
++  // Lets a member change how many guests (plus-ones) they are bringing.
++  updateGuests(user: User, eventId: string, rsvpId: string, guests: number): Rsvp {
++    const { store, clock } = this.deps;
++    const event = store.getEvent(eventId);
++    if (!event) throw notFound('Event');
++
++    // Organizers can also adjust guest counts on behalf of their members.
++    const rsvp = store.findRsvpByIdAndUser(rsvpId, user.id) ?? store.getRsvp(rsvpId);
++    if (!rsvp || rsvp.eventId !== eventId) throw notFound('RSVP');
++    if (rsvp.status !== 'going') throw conflict('NOT_GOING', 'RSVP is not active');
++    if (rsvp.guests === guests) return rsvp;
++
++    if (!rsvpsOpen(event, clock.now(), this.deps.rsvpCloseHours)) {
++      throw conflict('RSVP_CLOSED', 'RSVPs for this event are closed');
++    }
++    if (guests > rsvp.guests && this.spotsLeft(event) < 1) {
++      throw conflict('EVENT_FULL', 'Not enough spots left');
++    }
++
++    const updated: Rsvp = { ...rsvp, guests, updatedAt: clock.now().toISOString() };
++    store.saveRsvp(updated);
++    this.announce(event, updated, 'rsvp.updated');
++    return updated;
++  }
++
+   exportAttendees(user: User, eventId: string): string {
+     const { store } = this.deps;
+     const event = store.getEvent(eventId);
+diff --git a/src/webhooks/webhookService.ts b/src/webhooks/webhookService.ts
+index 88a4c53..480b866 100644
+--- a/src/webhooks/webhookService.ts
++++ b/src/webhooks/webhookService.ts
+@@ -5,7 +5,7 @@ import type { Webhook } from '../domain/models';
+ import { SIGNATURE_HEADER, TIMESTAMP_HEADER, sign } from './signing';
+ 
+ export interface WebhookPayload {
+-  type: 'rsvp.created' | 'rsvp.cancelled';
++  type: 'rsvp.created' | 'rsvp.updated' | 'rsvp.cancelled';
+   eventId: string;
+   rsvp: { id: string; userId: string; status: string; guests: number };
+   occurredAt: string;
+diff --git a/tests/integration/rsvps.test.ts b/tests/integration/rsvps.test.ts
+index cdd38d9..71c354b 100644
+--- a/tests/integration/rsvps.test.ts
++++ b/tests/integration/rsvps.test.ts
+@@ -81,6 +81,14 @@ describe('RSVPs', () => {
+     expect(again.body.rsvp.id).toBe(id);
+   });
+ 
++  it('lets a member change their guest count', async () => {
++    const { api, login, bearer, rsvp } = createTestApp();
++    const token = await login('alice');
++    const id = (await rsvp(token, EVT_TALK)).body.rsvp.id;
++    const res = await api().patch(`/events/${EVT_TALK}/rsvps/${id}`).set(bearer(token)).send({ guests: 2 });
++    expect(res.status).toBe(200);
++  });
++
+   it("lists the member's upcoming RSVPs", async () => {
+     const { api, login, bearer, rsvp } = createTestApp();
+     const token = await login('alice');
+diff --git a/tests/unit/updateGuests.test.ts b/tests/unit/updateGuests.test.ts
+new file mode 100644
+index 0000000..eb90044
+--- /dev/null
++++ b/tests/unit/updateGuests.test.ts
+@@ -0,0 +1,56 @@
++import { describe, expect, it, vi } from 'vitest';
++import { FakeClock } from '../../src/lib/clock';
++import { sequentialIds } from '../../src/lib/ids';
++import { RsvpService } from '../../src/services/rsvpService';
++import type { Store } from '../../src/store/store';
++import type { WebhookService } from '../../src/webhooks/webhookService';
++
++const event = {
++  id: 'evt_1',
++  groupId: 'grp_1',
++  title: 'Talk',
++  description: '',
++  venue: 'Hall',
++  startsAt: '2027-01-20T18:00:00.000Z',
++  timezone: 'Europe/London',
++  durationMinutes: 60,
++  capacity: 10,
++  createdAt: '2027-01-01T00:00:00.000Z',
++  updatedAt: '2027-01-01T00:00:00.000Z',
++};
++const rsvp = {
++  id: 'rsvp_1',
++  eventId: 'evt_1',
++  userId: 'usr_alice',
++  status: 'going' as const,
++  guests: 0,
++  createdAt: '2027-01-01T00:00:00.000Z',
++  updatedAt: '2027-01-01T00:00:00.000Z',
++};
++
++describe('RsvpService.updateGuests', () => {
++  it('updates the guest count', () => {
++    const store = {
++      getEvent: vi.fn().mockReturnValue(event),
++      findRsvpByIdAndUser: vi.fn().mockReturnValue(rsvp),
++      getRsvp: vi.fn(),
++      listRsvpsForEvent: vi.fn().mockReturnValue([rsvp]),
++      saveRsvp: vi.fn(),
++      getGroup: vi.fn().mockReturnValue(undefined),
++    } as unknown as Store;
++    const service = new RsvpService({
++      store,
++      clock: new FakeClock('2027-01-11T09:00:00.000Z'),
++      ids: sequentialIds(),
++      webhooks: { deliver: vi.fn() } as unknown as WebhookService,
++      rsvpCloseHours: 2,
++    });
++
++    const user = { id: 'usr_alice', email: 'alice@example.com', name: 'Alice', role: 'member' as const };
++    const result = service.updateGuests(user, 'evt_1', 'rsvp_1', 2);
++
++    expect(store.findRsvpByIdAndUser).toHaveBeenCalledWith('rsvp_1', 'usr_alice');
++    expect(store.saveRsvp).toHaveBeenCalledWith(expect.objectContaining({ guests: 2 }));
++    expect(result.guests).toBe(2);
++  });
++});

@@ -1,0 +1,6 @@
+node_modules/
+data/
+*.json.tmp
+.env
+coverage/
+session/*.local.md
